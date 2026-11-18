@@ -216,7 +216,7 @@ class IdfObject:
             lines.append(entry)
         return IdfObject("\n".join(lines) + "\n")
 
-
+#Checks inputed CSV for any scenarios other than base 24 that are to be run
 def parse_idf(text: str) -> list:
     """Return a list whose items are either raw str (comments/blank lines) or IdfObject."""
     items, buf, between = [], [], []
