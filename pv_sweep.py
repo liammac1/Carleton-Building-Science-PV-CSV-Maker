@@ -126,48 +126,59 @@ MODULES = {
 @dataclass
 class Scenario:
     name: str
-    mount: str = "roof"            # roof | rack
-    model: str = "simple"          # simple | onediode
-    coverage: float = 0.85         # roof mount only
-    efficiency: float = 0.18       # simple model only
-    module: str = "mono_400"       # onediode only
-    area_m2: float = 20.0          # rack + simple
-    n_modules: int = 10            # rack + onediode
-    tilt_deg: float = 45.0         # rack only (roof mount uses the roof's own tilt)
-    azimuth_deg: float = 180.0     # rack only
-    heat_transfer: str = "Decoupled"
-    inverter_eff: float = 0.96
-    # filled in when the IDF is generated
-    pv_area_m2: float = 0.0
-    rated_kw: float = 0.0
-    layout_note: str = ""
+    mount: str = "roof"            # Mounting type: 'roof'(flush on exisiting roof planes) or 'rack' (tilted ground/roof racks) | rack
+    model: str = "simple"          # EnergyPlus Pv physics model: 'simple' (fixed efficiency) or 'onediode'
+    coverage: float = 0.85         # Fraction of available roof surface covered by panels (used when mount = 'roof')
+    efficiency: float = 0.18       # Fixed DC cell conversion efficiency (used when mount= 'roof') simple model only
+    module: str = "mono_400"       # used when model ='onediode' only
+    area_m2: float = 20.0          # total collector area in m^2 (used when mount='rack'and model='simple')
+    n_modules: int = 10            # discrete number of panels (used when mount='rack' and model='onediode')
+    tilt_deg: float = 45.0         # Panel tilt angle from horizontal in degrees (rack mount only; roof mount inherits roof slope)
+    azimuth_deg: float = 180.0     # Compass orientation in degrees: 180 = due South (rack mount only)
+    heat_transfer: str = "Decoupled"    # Cell temperature mode: 'Decoupled'
+    inverter_eff: float = 0.96     # DC-to-AC inverter efficiency (accounts for ~4% conversion loss)
+   
+    # Output fields populated during IDF generation for reporting
+    pv_area_m2: float = 0.0        # Actual active solar collector area (m^2)
+    rated_kw: float = 0.0          # Nameplate DC capacity at Standard Test Conditions (kW)
+    layout_note: str = ""          
 
 
 def default_scenarios() -> list[Scenario]:
+    '''
+    Builds the default parametric test matrix (21 PV senarios, run alongside the auto-generated zero-PV baseline) to evaluate key solar design trade-offs in Yellowknife's subarctic climate.
+    '''
     s: list[Scenario] = []
-    # A. Flat on the roof, simple model: area (coverage) x module efficiency
+    # A: Roof-mounted parametric sweep (Coverage x Efficiency) using the Simple PV model.
+    # Tests how scaling active roof coverage (25%, 50%, 85%) and panel efficiency (15%, 18%, 21%)
+    # Impacts annual generation and summer grid export ratios. 
     for cov in (0.25, 0.50, 0.85):
         for eff in (0.15, 0.18, 0.21):
             s.append(Scenario(f"Roof {int(cov*100)}% cover, eff {int(eff*100)}%",
                               coverage=cov, efficiency=eff))
-    # B. Flat on the roof, single-diode model with real module parameters
+    # B: Roof-mounted equivalent One-Diode comparison (Monocrystalline vs. Polycrystalline). 
+    # Captures real-world temperature coefficients and low performance losses using datasheet specs.
     for mod in ("mono_400", "poly_280"):
         for cov in (0.50, 0.85):
             s.append(Scenario(f"Roof {int(cov*100)}% cover, 1-diode {mod}",
                               model="onediode", module=mod, coverage=cov))
-    # C. Single-diode model with the dynamic (thermal-mass) cell temperature model
+    # C: Cell thermal mass sensitivity tests. 
+    # Evaluates wheater transient cell heat capacity (Uleberg dynmaic model) significantly alters output compared to steady-state cell temperature assumptions.
     s.append(Scenario("Roof 85% cover, 1-diode mono_400, Uleberg cell temp",
                       model="onediode", module="mono_400", coverage=0.85,
                       heat_transfer="DecoupledUllebergDynamic"))
-    # D. Tilted rack, south-facing: tilt sweep at fixed area
+    # D: South-facing tilted rack angle sweep (15 degrees to 75 degrees at fixed 20m^2 area).
+    # Investigates the high-latitude ( 62.46 degree North) trade-off between capturing low-angle spring/autum sun versus minimzing inter-rowshading on the roof footprint.
     for tilt in (15, 30, 45, 60, 75):
         s.append(Scenario(f"Rack 20 m2, tilt {tilt}", mount="rack",
                           area_m2=20, tilt_deg=tilt))
-    # E. Tilted rack: area sweep at 45 deg
+    # E: Rack system sizing sweep (10m^2 vs. 30m^2 at 45 degree tilt). 
+    # Complements the 20 m^2 case in D to show diminishing self-consumption returns as capcity grows.
     for area in (10, 30):
         s.append(Scenario(f"Rack {area} m2, tilt 45", mount="rack",
                           area_m2=area, tilt_deg=45))
-    # F. Tilted rack, single-diode modules
+    # F: Discrete tilted rack configerations using the One-Diode 400W monocrystalline module. 
+    # Represents realistic commerical rack installation (4.0 kW at 45 degree vs. 6.0 kW at 60 degrees).
     s.append(Scenario("Rack 10 x mono_400, tilt 45, 1-diode", mount="rack",
                       model="onediode", module="mono_400", n_modules=10, tilt_deg=45))
     s.append(Scenario("Rack 15 x mono_400, tilt 60, 1-diode", mount="rack",
