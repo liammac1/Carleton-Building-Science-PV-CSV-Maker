@@ -882,6 +882,242 @@ def build_workbook(rows: list[dict], monthly: list[dict], log: list[dict], out: 
 
     wb.calculation.fullCalcOnLoad = True
     wb.save(out)
+    write_cached_values(wb, out)
+
+
+# =============================================================================
+# 7b. CACHED VALUES FOR FORMULAS
+# =============================================================================
+# openpyxl saves formulas without their results, so previews, phones, Google Drive
+# viewers and Excel's Protected View show those cells blank. This computes every
+# formula in Python and writes the result next to it. Excel still recalculates on
+# open, so edits on the Assumptions sheet keep working.
+import re as _re
+import zipfile as _zip
+from xml.sax.saxutils import escape as _esc
+
+_TOKEN = _re.compile(r"""\s*(?:
+    (?P<num>\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)|
+    (?P<str>"[^"]*")|
+    (?P<ref>(?:(?:'[^']+'|[A-Za-z_][\w.]*)!)?\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?)|
+    (?P<func>[A-Z][A-Z0-9.]*)(?=\()|
+    (?P<op><=|>=|<>|[-+*/(),=<>&]))""", _re.X)
+
+
+def _col_num(letters: str) -> int:
+    n = 0
+    for ch in letters:
+        n = n * 26 + ord(ch) - 64
+    return n
+
+
+class _FormulaEvaluator:
+    def __init__(self, wb):
+        self.wb, self.memo, self.busy = wb, {}, set()
+
+    def value(self, sheet: str, coord: str):
+        key = (sheet, coord)
+        if key in self.memo:
+            return self.memo[key]
+        raw = self.wb[sheet][coord].value
+        if isinstance(raw, str) and raw.startswith("="):
+            if key in self.busy:
+                raise ValueError(f"circular reference at {sheet}!{coord}")
+            self.busy.add(key)
+            try:
+                val = self.evaluate(raw[1:], sheet)
+            finally:
+                self.busy.discard(key)
+        else:
+            val = raw
+        self.memo[key] = val
+        return val
+
+    # --- tiny recursive-descent parser: returns closures so IF/IFERROR are lazy ---
+    def evaluate(self, formula: str, sheet: str):
+        toks, pos = [], 0
+        while pos < len(formula):
+            m = _TOKEN.match(formula, pos)
+            if not m or m.end() == pos:
+                if formula[pos:].strip() == "":
+                    break
+                raise ValueError(f"cannot parse formula: {formula}")
+            kind = m.lastgroup
+            toks.append((kind, m.group(kind)))
+            pos = m.end()
+        self.toks, self.i, self.sheet = toks, 0, sheet
+        node = self._cmp()
+        if self.i != len(toks):
+            raise ValueError(f"cannot parse formula: {formula}")
+        return node()
+
+    def _peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else (None, None)
+
+    def _take(self, expected=None):
+        tok = self._peek()
+        if expected and tok[1] != expected:
+            raise ValueError(f"expected {expected!r}")
+        self.i += 1
+        return tok
+
+    def _cmp(self):
+        left = self._add()
+        ops = {"=": lambda a, b: a == b, "<>": lambda a, b: a != b, "<": lambda a, b: a < b,
+               ">": lambda a, b: a > b, "<=": lambda a, b: a <= b, ">=": lambda a, b: a >= b}
+        if self._peek()[1] in ops:
+            fn = ops[self._take()[1]]
+            right = self._add()
+            return lambda l=left, r=right: fn(l(), r())
+        return left
+
+    def _add(self):
+        node = self._mul()
+        while self._peek()[1] in ("+", "-"):
+            op = self._take()[1]
+            rhs = self._mul()
+            node = (lambda a=node, b=rhs: _num(a()) + _num(b())) if op == "+" else \
+                   (lambda a=node, b=rhs: _num(a()) - _num(b()))
+        return node
+
+    def _mul(self):
+        node = self._unary()
+        while self._peek()[1] in ("*", "/"):
+            op = self._take()[1]
+            rhs = self._unary()
+            node = (lambda a=node, b=rhs: _num(a()) * _num(b())) if op == "*" else \
+                   (lambda a=node, b=rhs: _num(a()) / _num(b()))
+        return node
+
+    def _unary(self):
+        if self._peek()[1] == "-":
+            self._take()
+            inner = self._unary()
+            return lambda: -_num(inner())
+        if self._peek()[1] == "+":
+            self._take()
+        return self._primary()
+
+    def _primary(self):
+        kind, text = self._take()
+        if kind == "num":
+            v = float(text)
+            return lambda: v
+        if kind == "str":
+            s = text[1:-1]
+            return lambda: s
+        if kind == "op" and text == "(":
+            node = self._cmp()
+            self._take(")")
+            return node
+        if kind == "ref":
+            sheet, ref = (text.rsplit("!", 1) if "!" in text else (self.sheet, text))
+            sheet = sheet.strip("'")
+            ref = ref.replace("$", "")
+            if ":" in ref:
+                return lambda s=sheet, r=ref: self._range(s, r)
+            return lambda s=sheet, r=ref: self.value(s, r)
+        if kind == "func":
+            self._take("(")
+            args = []
+            if self._peek()[1] != ")":
+                args.append(self._cmp())
+                while self._peek()[1] == ",":
+                    self._take()
+                    args.append(self._cmp())
+            self._take(")")
+            return self._func(text, args)
+        raise ValueError(f"unexpected token {text!r}")
+
+    def _range(self, sheet, ref):
+        a, b = ref.split(":")
+        ca, ra = _re.match(r"([A-Z]+)(\d+)", a).groups()
+        cb, rb = _re.match(r"([A-Z]+)(\d+)", b).groups()
+        out = []
+        for r in range(int(ra), int(rb) + 1):
+            for c in range(_col_num(ca), _col_num(cb) + 1):
+                out.append(self.value(sheet, f"{get_column_letter(c)}{r}"))
+        return out
+
+    @staticmethod
+    def _func(name, args):
+        def flat(vals):
+            for v in vals:
+                if isinstance(v, list):
+                    yield from (x for x in v if isinstance(x, (int, float)))
+                else:
+                    yield _num(v)
+        if name == "IF":
+            return lambda: (args[1]() if args[0]() else (args[2]() if len(args) > 2 else False))
+        if name == "IFERROR":
+            def f():
+                try:
+                    return args[0]()
+                except (ZeroDivisionError, ValueError, TypeError):
+                    return args[1]()
+            return f
+        if name == "MAX":
+            return lambda: max(flat(a() for a in args))
+        if name == "MIN":
+            return lambda: min(flat(a() for a in args))
+        if name == "SUM":
+            return lambda: sum(flat(a() for a in args))
+        raise ValueError(f"function {name} not supported by the value cache")
+
+
+def _num(v):
+    if v is None or v == "":
+        return 0.0
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float)):
+        return float(v)
+    raise TypeError(f"not a number: {v!r}")
+
+
+def write_cached_values(wb, path: Path) -> int:
+    """Compute every formula in wb and store the results inside the saved file at path."""
+    ev = _FormulaEvaluator(wb)
+    per_sheet = []
+    for ws in wb.worksheets:
+        vals = {}
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    v = ev.value(ws.title, cell.coordinate)
+                    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+                        continue
+                    vals[cell.coordinate] = v
+        per_sheet.append(vals)
+    tmp = path.with_suffix(".tmp.xlsx")
+    count = 0
+    with _zip.ZipFile(path) as zin, _zip.ZipFile(tmp, "w", _zip.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            m = _re.fullmatch(r"xl/worksheets/sheet(\d+)\.xml", item.filename)
+            if m and int(m.group(1)) <= len(per_sheet):
+                vals = per_sheet[int(m.group(1)) - 1]
+                text = data.decode("utf-8")
+
+                def fill(mo):
+                    nonlocal count
+                    attrs, coord, formula = mo.group(1), mo.group(2), mo.group(3)
+                    if coord not in vals:
+                        return mo.group(0)
+                    v = vals[coord]
+                    count += 1
+                    if isinstance(v, bool):
+                        return f'<c{attrs} t="b"><f>{formula}</f><v>{int(v)}</v></c>'
+                    if isinstance(v, (int, float)):
+                        return f"<c{attrs}><f>{formula}</f><v>{repr(float(v))}</v></c>"
+                    return f'<c{attrs} t="str"><f>{formula}</f><v>{_esc(str(v))}</v></c>'
+
+                text = _re.sub(r'<c((?: (?!t=)[a-z]+="[^"]*")*? r="([A-Z]+\d+)"(?: (?!t=)[a-z]+="[^"]*")*)>'
+                               r"<f>(.*?)</f><v ?/?>(?:</v>)?</c>", fill, text)
+                data = text.encode("utf-8")
+            zout.writestr(item, data)
+    os.replace(tmp, path)
+    return count
 
 
 # =============================================================================
