@@ -17,10 +17,12 @@ on:
         default: ""
         required: false
 
+# getting the energyplus framework to run the IDF
 env:
   EPLUS_VERSION: "26.1.0"
   EPLUS_URL: "https://github.com/NREL/EnergyPlus/releases/download/v26.1.0/EnergyPlus-26.1.0-6f2e40d102-Linux-Ubuntu24.04-x86_64.tar.gz"
 
+# installing the needed python libraries to run the actions, and then running them on an ubuntu workflow
 jobs:
   sweep:
     runs-on: ubuntu-24.04
@@ -44,6 +46,7 @@ jobs:
           path: ~/energyplus
           key: energyplus-${{ env.EPLUS_VERSION }}-ubuntu24.04
 
+# installing energyplus
       - name: Install EnergyPlus ${{ env.EPLUS_VERSION }}
         if: steps.cache-eplus.outputs.cache-hit != 'true'
         run: |
@@ -52,6 +55,7 @@ jobs:
           tar xzf /tmp/eplus.tar.gz -C ~/energyplus --strip-components=1
           ~/energyplus/energyplus --version
 
+# getting the weather file
       - name: Pick weather file
         id: weather
         run: |
@@ -66,6 +70,7 @@ jobs:
           echo "Using weather file: $EPW"
           echo "epw=$EPW" >> "$GITHUB_OUTPUT"
 
+# running the actual code
       - name: Run the sweep
         run: |
           mkdir -p results
@@ -80,12 +85,14 @@ jobs:
             --jobs "$(nproc)" \
             $EXTRA
 
+# uploading the spreadsheet to github artifacts
       - name: Upload spreadsheet
         uses: actions/upload-artifact@v4
         with:
           name: pv-results
           path: results/*.xlsx
 
+# ensuring that errors are visible from runs
       - name: Upload error files from failed runs
         if: always()
         uses: actions/upload-artifact@v4
