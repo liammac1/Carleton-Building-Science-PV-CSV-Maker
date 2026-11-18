@@ -1,0 +1,4 @@
+name,mount,model,coverage,efficiency,module,area_m2,n_modules,tilt_deg,azimuth_deg,heat_transfer,inverter_eff
+Roof 85% cover eff 20%,roof,simple,0.85,0.20,,,,,,Decoupled,0.97
+Rack 25 m2 tilt 50 south,rack,simple,,0.20,,25,,50,180,Decoupled,0.96
+Rack 12 x mono_400 tilt 55 SW,rack,onediode,,,mono_400,,12,55,200,DecoupledUllebergDynamic,0.96
