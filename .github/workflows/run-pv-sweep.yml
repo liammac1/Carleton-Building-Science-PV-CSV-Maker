@@ -1,0 +1,95 @@
+name: Run PV sweep
+
+# Start it from the repository's "Actions" tab -> "Run PV sweep" -> "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      idf:
+        description: "Model file (path in the repo)"
+        default: "Baseline_PV_corrected.idf"
+        required: true
+      epw:
+        description: "Weather file name. Leave blank to use the first .epw file in the repository"
+        default: ""
+        required: false
+      scenarios_csv:
+        description: "Optional scenario CSV (e.g. example_scenarios.csv). Blank = built-in 24-setup sweep"
+        default: ""
+        required: false
+
+env:
+  EPLUS_VERSION: "26.1.0"
+  EPLUS_URL: "https://github.com/NREL/EnergyPlus/releases/download/v26.1.0/EnergyPlus-26.1.0-6f2e40d102-Linux-Ubuntu24.04-x86_64.tar.gz"
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Cache EnergyPlus
+        id: cache-eplus
+        uses: actions/cache@v4
+        with:
+          path: ~/energyplus
+          key: energyplus-${{ env.EPLUS_VERSION }}-ubuntu24.04
+
+      - name: Install EnergyPlus ${{ env.EPLUS_VERSION }}
+        if: steps.cache-eplus.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/energyplus
+          curl -sSL -o /tmp/eplus.tar.gz "$EPLUS_URL"
+          tar xzf /tmp/eplus.tar.gz -C ~/energyplus --strip-components=1
+          ~/energyplus/energyplus --version
+
+      - name: Pick weather file
+        id: weather
+        run: |
+          EPW="${{ inputs.epw }}"
+          if [ -z "$EPW" ]; then
+            EPW=$(ls *.epw weather/*.epw 2>/dev/null | head -n 1 || true)
+          fi
+          if [ -z "$EPW" ] || [ ! -f "$EPW" ]; then
+            echo "::error::No weather file found. Upload the Yellowknife .epw file into the repository."
+            exit 1
+          fi
+          echo "Using weather file: $EPW"
+          echo "epw=$EPW" >> "$GITHUB_OUTPUT"
+
+      - name: Run the sweep
+        run: |
+          mkdir -p results
+          EXTRA=""
+          if [ -n "${{ inputs.scenarios_csv }}" ]; then EXTRA="--scenarios ${{ inputs.scenarios_csv }}"; fi
+          python pv_sweep.py \
+            --idf "${{ inputs.idf }}" \
+            --epw "${{ steps.weather.outputs.epw }}" \
+            --energyplus ~/energyplus/energyplus \
+            --out "results/pv_results_$(date +%Y-%m-%d_%H%M).xlsx" \
+            --workdir runs \
+            --jobs "$(nproc)" \
+            $EXTRA
+
+      - name: Upload spreadsheet
+        uses: actions/upload-artifact@v4
+        with:
+          name: pv-results
+          path: results/*.xlsx
+
+      - name: Upload error files from failed runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-run-logs
+          path: runs/**/eplusout.err
+          if-no-files-found: ignore
